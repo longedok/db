@@ -1,1 +1,5 @@
 /target
+__pycache__/
+db.dat
+test.dat
+.python-version

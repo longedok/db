@@ -1,10 +1,33 @@
 #[macro_use] extern crate scan_fmt;
 use std::io::{self, Write};
+use std::io::prelude::*;
+use std::fs::OpenOptions;
 use std::process;
 use std::cmp;
 use std::mem;
 use std::convert::TryInto;
 use std::str;
+use std::fs::File;
+use std::io::SeekFrom;
+use std::env;
+
+const COLUMN_USERNAME_SIZE: usize = 32;
+const COLUMN_EMAIL_SIZE: usize = 255;
+
+const ID_SIZE: usize = mem::size_of::<i32>();
+const USERNAME_SIZE: usize = mem::size_of::<[u8; COLUMN_USERNAME_SIZE]>();
+const EMAIL_SIZE: usize = mem::size_of::<[u8; COLUMN_EMAIL_SIZE]>();
+
+const ID_OFFSET: usize = 0;
+const USERNAME_OFFSET: usize = ID_OFFSET + ID_SIZE;
+const EMAIL_OFFSET: usize = USERNAME_OFFSET + USERNAME_SIZE;
+
+const ROW_SIZE: usize = ID_SIZE + USERNAME_SIZE + EMAIL_SIZE;
+
+const PAGE_SIZE: usize = 4096;
+const TABLE_MAX_PAGES: usize = 100;
+const ROWS_PER_PAGE: usize = PAGE_SIZE / ROW_SIZE;
+const TABLE_MAX_ROWS: usize = ROWS_PER_PAGE * TABLE_MAX_PAGES;
 
 #[derive(Debug)]
 enum StatementType {
@@ -16,10 +39,15 @@ enum StatementType {
 enum PrepareError {
     UnrecognizedStatement,
     SyntaxError,
+    StringTooLong,
+    NegativeId,
 }
 
-const COLUMN_USERNAME_SIZE: usize = 32;
-const COLUMN_EMAIL_SIZE: usize = 255;
+#[derive(Debug)]
+enum PagerError {
+    PageNumberOutOfBounds,
+    EmptyPageFlush,
+}
 
 #[derive(Debug)]
 #[repr(C)]
@@ -29,68 +57,9 @@ struct Row {
     email: [u8; COLUMN_EMAIL_SIZE],
 }
 
-#[derive(Debug)]
-#[repr(C)]
-struct Statement {
-    statement_type: StatementType,
-    row_to_insert: Option<Row>, // only used by insert statement
-}
-
-// field sizes
-const ID_SIZE: usize = mem::size_of::<i32>();
-const USERNAME_SIZE: usize = mem::size_of::<[u8; COLUMN_USERNAME_SIZE]>();
-const EMAIL_SIZE: usize = mem::size_of::<[u8; COLUMN_EMAIL_SIZE]>();
-// fields offsets
-const ID_OFFSET: usize = 0;
-const USERNAME_OFFSET: usize = ID_OFFSET + ID_SIZE;
-const EMAIL_OFFSET: usize = USERNAME_OFFSET + USERNAME_SIZE;
-// row size
-const ROW_SIZE: usize = ID_SIZE + USERNAME_SIZE + EMAIL_SIZE;
-
-const PAGE_SIZE: usize = 4096;
-const TABLE_MAX_PAGES: usize = 100;
-const ROWS_PER_PAGE: usize = PAGE_SIZE / ROW_SIZE;
-const TABLE_MAX_ROWS: usize = ROWS_PER_PAGE * TABLE_MAX_PAGES;
-
-impl Statement {
-    fn prepare(statement_text: &str) -> Result<Self, PrepareError> {
-        if statement_text.starts_with("insert") {
-            let scan_result = scan_fmt!(
-                statement_text, "insert {d} {} {}", i32, String, String
-            );
-            match scan_result {
-                Ok((id, username, email)) => {
-                    let mut username_bytes = [0u8; COLUMN_USERNAME_SIZE];
-                    let mut email_bytes = [0u8; COLUMN_EMAIL_SIZE];
-                    username_bytes[
-                        ..cmp::min(username.len(), COLUMN_USERNAME_SIZE)
-                    ].copy_from_slice(username.as_bytes());
-                    email_bytes[
-                        ..cmp::min(email.len(), COLUMN_EMAIL_SIZE)
-                    ].copy_from_slice(email.as_bytes());
-
-                    return Ok(Self {
-                        statement_type: StatementType::Insert,
-                        row_to_insert: Some(Row {
-                            id,
-                            username: username_bytes,
-                            email: email_bytes,
-                        })
-                    });
-                },
-                Err(_) => return Err(PrepareError::SyntaxError)
-            };
-        }
-
-        if statement_text.starts_with("select") {
-            return Ok(Self {
-                statement_type: StatementType::Select,
-                row_to_insert: None
-            });
-        }
-
-        Err(PrepareError::UnrecognizedStatement)
-    }
+fn str_from_array(arr: &[u8]) -> &str {
+    let null_pos = arr.iter().position(|&c| c == b'\0').unwrap_or(arr.len());
+    str::from_utf8(&arr[..null_pos]).unwrap()
 }
 
 impl Row {
@@ -107,42 +76,189 @@ impl Row {
 
     fn serialize(&self, buffer: &mut [u8]) {
         buffer[ID_OFFSET..ID_OFFSET+ID_SIZE].copy_from_slice(&self.id.to_le_bytes());
-        buffer[USERNAME_OFFSET..USERNAME_OFFSET+USERNAME_SIZE].copy_from_slice(&self.username);
+        buffer[USERNAME_OFFSET..USERNAME_OFFSET+USERNAME_SIZE]
+            .copy_from_slice(&self.username);
         buffer[EMAIL_OFFSET..EMAIL_OFFSET+EMAIL_SIZE].copy_from_slice(&self.email);
     }
 
     fn print(&self) {
-        let username_str = str::from_utf8(&self.username).unwrap();
-        let email_str = str::from_utf8(&self.email).unwrap();
+        let username_str = str_from_array(&self.username);
+        let email_str = str_from_array(&self.email);
         println!("({}, {}, {})", self.id, username_str, email_str);
     }
 }
 
+
 #[derive(Debug)]
-struct Table {
-    num_rows: usize,
+struct Statement {
+    statement_type: StatementType,
+    row_to_insert: Option<Row>, // only used by insert statement
+}
+
+impl Statement {
+    fn prepare_insert(statement_text: &str) -> Result<Self, PrepareError> {
+        let scan_result = scan_fmt!(
+            statement_text, "insert {d} {} {}", i32, String, String
+        );
+        match scan_result {
+            Ok((id, username, email)) => {
+                if id < 0 {
+                    return Err(PrepareError::NegativeId)
+                }
+                if username.len() > COLUMN_USERNAME_SIZE {
+                    return Err(PrepareError::StringTooLong)
+                }
+
+                if email.len() > COLUMN_EMAIL_SIZE {
+                    return Err(PrepareError::StringTooLong)
+                }
+
+                let mut username_bytes = [0u8; COLUMN_USERNAME_SIZE];
+                let mut email_bytes = [0u8; COLUMN_EMAIL_SIZE];
+
+                username_bytes[..cmp::min(username.len(), COLUMN_USERNAME_SIZE)]
+                    .copy_from_slice(username.as_bytes());
+                email_bytes[..cmp::min(email.len(), COLUMN_EMAIL_SIZE)]
+                    .copy_from_slice(email.as_bytes());
+
+                return Ok(Self {
+                    statement_type: StatementType::Insert,
+                    row_to_insert: Some(Row {
+                        id,
+                        username: username_bytes,
+                        email: email_bytes,
+                    })
+                });
+            },
+            Err(_) => return Err(PrepareError::SyntaxError)
+        };
+    }
+
+    fn prepare(statement_text: &str) -> Result<Self, PrepareError> {
+        if statement_text.starts_with("insert") {
+            return Self::prepare_insert(statement_text);
+        }
+
+        if statement_text.starts_with("select") {
+            return Ok(Self {
+                statement_type: StatementType::Select,
+                row_to_insert: None
+            });
+        }
+
+        Err(PrepareError::UnrecognizedStatement)
+    }
+}
+
+#[derive(Debug)]
+#[repr(C)]
+struct Pager {
+    file: File,
+    file_length: u64,
     pages: [Option<Box<[u8; PAGE_SIZE]>>; TABLE_MAX_PAGES]
 }
 
-impl Table {
-    fn new() -> Self {
+impl Pager {
+    fn open(filename: &str) -> Self {
+        let mut file = OpenOptions::new()
+            .write(true)
+            .read(true)
+            .create(true)
+            .open(filename)
+            .unwrap();
+        let file_length = file.seek(SeekFrom::End(0)).unwrap();
+
         const INIT: Option<Box<[u8; PAGE_SIZE]>> = None;
         Self {
-            num_rows: 0,
+            file,
+            file_length,
             pages: [INIT; TABLE_MAX_PAGES],
+        }
+    }
+
+    fn get_page(&mut self, page_num: usize) -> Result<&mut [u8], PagerError> {
+        if page_num > TABLE_MAX_PAGES {
+            return Err(PagerError::PageNumberOutOfBounds);
+        }
+
+        if let None = self.pages[page_num] {
+            let mut page = Box::new([0u8; PAGE_SIZE]);
+            let mut num_pages = self.file_length as usize / PAGE_SIZE;
+
+            if self.file_length % PAGE_SIZE as u64 != 0 {
+                num_pages += 1;
+            }
+
+            if page_num <= num_pages {
+                self.file.seek(SeekFrom::Start((page_num * PAGE_SIZE) as u64)).unwrap();
+                self.file.read(&mut *page).unwrap();
+            }
+
+            self.pages[page_num].replace(page);
+        }
+
+        Ok(&mut self.pages[page_num].as_mut().unwrap()[..])
+    }
+
+    fn flush(&mut self, page_num: usize, size: usize) -> Result<(), PagerError> {
+        if let None = self.pages[page_num] {
+            return Err(PagerError::EmptyPageFlush);
+        }
+
+        self.file.seek(SeekFrom::Start((page_num * PAGE_SIZE) as u64)).unwrap();
+        self.file.write(
+            self.pages[page_num].as_ref().unwrap()[..size].as_ref()
+        ).unwrap();
+
+        Ok(())
+    }
+}
+
+#[derive(Debug)]
+#[repr(C)]
+struct Table {
+    num_rows: usize,
+    pager: Pager,
+}
+
+impl Table {
+    fn new(filename: &str) -> Self {
+        let pager = Pager::open(filename);
+        let num_rows = pager.file_length as usize / ROW_SIZE;
+
+        Self {
+            num_rows,
+            pager,
         }
     }
 
     fn row_slot(&mut self, row_num: usize) -> &mut [u8] {
         let page_num: usize = row_num / ROWS_PER_PAGE;
 
-        if let None = self.pages[page_num] {
-            self.pages[page_num].replace(Box::new([0u8; PAGE_SIZE]));
-        }
-
         let row_offset = row_num % ROWS_PER_PAGE;
         let byte_offset = row_offset * ROW_SIZE;
-        &mut self.pages[page_num].as_mut().unwrap()[byte_offset..byte_offset+ROW_SIZE]
+
+        let page = self.pager.get_page(page_num).unwrap();
+        &mut page[byte_offset..byte_offset+ROW_SIZE]
+    }
+
+    fn close(&mut self) {
+        let num_full_pages = self.num_rows / ROWS_PER_PAGE;
+
+        for i in 0..num_full_pages {
+            match self.pager.pages[i] {
+                Some(_) => self.pager.flush(i, ROW_SIZE),
+                None => continue
+            };
+        }
+
+        let num_additional_rows = self.num_rows % ROWS_PER_PAGE;
+        if num_additional_rows > 0 {
+            let page_num = num_full_pages;
+            if let Some(_) = self.pager.pages[page_num] {
+                self.pager.flush(page_num, num_additional_rows * ROW_SIZE);
+            }
+        }
     }
 }
 
@@ -156,18 +272,20 @@ fn execute_insert(statement: &Statement, table: &mut Table) -> Result<(), Execut
         return Err(ExecuteError::TableFull);
     }
 
-    let row_to_insert = &(statement.row_to_insert.as_ref().unwrap());
+    let row_to_insert = statement.row_to_insert.as_ref().unwrap();
     row_to_insert.serialize(table.row_slot(table.num_rows));
     table.num_rows += 1;
 
     Ok(())
 }
 
+#[allow(unused_variables)]
 fn execute_select(statement: &Statement, table: &mut Table) -> Result<(), ExecuteError> {
     for i in 0..table.num_rows {
         let row = Row::deserialize(table.row_slot(i));
         row.print();
     }
+
     Ok(())
 }
 
@@ -190,25 +308,32 @@ fn read_input(prompt: &str) -> io::Result<String> {
     Ok(input_buffer.trim().to_string())
 }
 
-fn do_meta_command(command: &str) -> Result<(), ()> {
+fn do_meta_command(command: &str, table: &mut Table) -> Result<(), ()> {
     match command {
-        ".exit" => process::exit(0),
+        ".exit" => {
+            table.close();
+            process::exit(0);
+        },
         _ => return Err(())
     };
 }
 
 fn main() -> io::Result<()> {
-    let mut table = Table::new();
+    let args: Vec<String> = env::args().collect();
+    let default_name = String::from("db.dat");
+    let db_filename;
+    if args.len() < 2 {
+        db_filename = &default_name;
+    } else {
+        db_filename = &args[1];
+    }
+    let mut table = Table::new(&db_filename);
 
     loop {
         let input = read_input("db > ")?;
 
-        if input.is_empty() {
-            break;
-        }
-
         if input.starts_with(".") {
-            match do_meta_command(&input) {
+            match do_meta_command(&input, &mut table) {
                 Ok(()) => continue,
                 Err(()) => {
                     println!("Unrecognized command: {}", input);
@@ -223,7 +348,10 @@ fn main() -> io::Result<()> {
                     Ok(()) => println!("Executed."),
                     Err(execute_error) => {
                         match execute_error {
-                            ExecuteError::TableFull => println!("Error: Table full.")
+                            ExecuteError::TableFull => {
+                                println!("Error: Table full.");
+                                continue;
+                            }
                         }
                     }
                 }
@@ -236,11 +364,17 @@ fn main() -> io::Result<()> {
                 PrepareError::SyntaxError => {
                     println!("Syntax error. Count not parse statement.");
                     continue;
+                },
+                PrepareError::StringTooLong => {
+                    println!("String is too long.");
+                    continue;
+                },
+                PrepareError::NegativeId => {
+                    println!("ID must be positive.");
+                    continue;
                 }
             }
         }
     }
-
-    Ok(())
 }
 
