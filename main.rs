@@ -108,7 +108,6 @@ impl Statement {
                 if username.len() > COLUMN_USERNAME_SIZE {
                     return Err(PrepareError::StringTooLong)
                 }
-
                 if email.len() > COLUMN_EMAIL_SIZE {
                     return Err(PrepareError::StringTooLong)
                 }
@@ -226,20 +225,7 @@ impl Table {
         let pager = Pager::open(filename);
         let num_rows = pager.file_length as usize / ROW_SIZE;
 
-        Self {
-            num_rows,
-            pager,
-        }
-    }
-
-    fn row_slot(&mut self, row_num: usize) -> &mut [u8] {
-        let page_num: usize = row_num / ROWS_PER_PAGE;
-
-        let row_offset = row_num % ROWS_PER_PAGE;
-        let byte_offset = row_offset * ROW_SIZE;
-
-        let page = self.pager.get_page(page_num).unwrap();
-        &mut page[byte_offset..byte_offset+ROW_SIZE]
+        Self { num_rows, pager }
     }
 
     fn close(&mut self) {
@@ -262,6 +248,50 @@ impl Table {
     }
 }
 
+struct Cursor<'a> {
+    table: &'a mut Table,
+    row_num: usize,
+    end_of_table: bool,
+}
+
+impl <'a> Cursor<'a> {
+    fn table_start(table: &'a mut Table) -> Self {
+        let end_of_table = table.num_rows == 0;
+        Cursor {
+            table,
+            row_num: 0,
+            end_of_table,
+        }
+    }
+
+    fn table_end(table: &'a mut Table) -> Self {
+        let row_num = table.num_rows;
+        Cursor {
+            table,
+            row_num,
+            end_of_table: true,
+        }
+    }
+
+    fn advance(&mut self) {
+        self.row_num += 1;
+        if self.row_num >= self.table.num_rows {
+            self.end_of_table = true;
+        }
+    }
+
+    fn value(&mut self) -> &mut [u8] {
+        let row_num = self.row_num;
+        let page_num: usize = row_num / ROWS_PER_PAGE;
+
+        let row_offset = row_num % ROWS_PER_PAGE;
+        let byte_offset = row_offset * ROW_SIZE;
+
+        let page = self.table.pager.get_page(page_num).unwrap();
+        &mut page[byte_offset..byte_offset+ROW_SIZE]
+    }
+}
+
 #[derive(Debug)]
 enum ExecuteError {
     TableFull,
@@ -273,7 +303,9 @@ fn execute_insert(statement: &Statement, table: &mut Table) -> Result<(), Execut
     }
 
     let row_to_insert = statement.row_to_insert.as_ref().unwrap();
-    row_to_insert.serialize(table.row_slot(table.num_rows));
+    let mut cursor = Cursor::table_end(table);
+    row_to_insert.serialize(cursor.value());
+
     table.num_rows += 1;
 
     Ok(())
@@ -281,9 +313,12 @@ fn execute_insert(statement: &Statement, table: &mut Table) -> Result<(), Execut
 
 #[allow(unused_variables)]
 fn execute_select(statement: &Statement, table: &mut Table) -> Result<(), ExecuteError> {
-    for i in 0..table.num_rows {
-        let row = Row::deserialize(table.row_slot(i));
+    let mut cursor = Cursor::table_start(table);
+
+    while !cursor.end_of_table {
+        let row = Row::deserialize(cursor.value());
         row.print();
+        cursor.advance();
     }
 
     Ok(())
