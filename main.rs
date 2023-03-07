@@ -247,7 +247,7 @@ impl Table {
 
         for i in 0..num_full_pages {
             match self.pager.pages[i] {
-                Some(_) => self.pager.flush(i, ROW_SIZE),
+                Some(_) => self.pager.flush(i, ROW_SIZE).unwrap(),
                 None => continue
             };
         }
@@ -256,7 +256,7 @@ impl Table {
         if num_additional_rows > 0 {
             let page_num = num_full_pages;
             if let Some(_) = self.pager.pages[page_num] {
-                self.pager.flush(page_num, num_additional_rows * ROW_SIZE);
+                self.pager.flush(page_num, num_additional_rows * ROW_SIZE).unwrap();
             }
         }
     }
@@ -320,14 +320,14 @@ fn do_meta_command(command: &str, table: &mut Table) -> Result<(), ()> {
 
 fn main() -> io::Result<()> {
     let args: Vec<String> = env::args().collect();
-    let default_name = String::from("db.dat");
-    let db_filename;
-    if args.len() < 2 {
-        db_filename = &default_name;
+    let filename;
+    if args.len() > 1 {
+        filename = args[1].as_str();
     } else {
-        db_filename = &args[1];
+        filename = "db.dat";
     }
-    let mut table = Table::new(&db_filename);
+
+    let mut table = Table::new(&filename);
 
     loop {
         let input = read_input("db > ")?;
