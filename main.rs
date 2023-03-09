@@ -29,6 +29,31 @@ const TABLE_MAX_PAGES: usize = 100;
 const ROWS_PER_PAGE: usize = PAGE_SIZE / ROW_SIZE;
 const TABLE_MAX_ROWS: usize = ROWS_PER_PAGE * TABLE_MAX_PAGES;
 
+// Common Node Header Layout
+const NODE_TYPE_SIZE: usize = mem::size_of::<u8>();
+const NODE_TYPE_OFFSET: usize = 0;
+const IS_ROOT_SIZE: usize = mem::size_of::<u8>();
+const IS_ROOT_OFFSET: usize = NODE_TYPE_SIZE;
+const PARENT_POINTER_SIZE: usize = mem::size_of::<u32>();
+const PARENT_POINTER_OFFSET: usize = IS_ROOT_OFFSET + IS_ROOT_SIZE;
+const COMMON_NODE_HEADER_SIZE: usize =
+    NODE_TYPE_SIZE + IS_ROOT_SIZE + PARENT_POINTER_SIZE;
+
+// Leaf Node Header Layout
+const LEAF_NODE_NUM_CELLS_SIZE: usize = mem::size_of::<u32>();
+const LEAF_NODE_NUM_CELLS_OFFSET: usize = COMMON_NODE_HEADER_SIZE;
+const LEAF_NODE_HEADER_SIZE: usize =
+    COMMON_NODE_HEADER_SIZE + LEAF_NODE_NUM_CELLS_SIZE;
+
+// Leaf Node Body Layout
+const LEAF_NODE_KEY_SIZE: usize = mem::size_of::<u32>();
+const LEAF_NODE_KEY_OFFSET: usize = 0;
+const LEAF_NODE_VALUE_SIZE: usize = ROW_SIZE;
+const LEAF_NODE_VALUE_OFFSET: usize = LEAF_NODE_KEY_OFFSET + LEAF_NODE_KEY_SIZE;
+const LEAF_NODE_CELL_SIZE: usize = LEAF_NODE_KEY_SIZE + LEAF_NODE_VALUE_SIZE;
+const LEAF_NODE_SPACE_FOR_CELLS: usize = PAGE_SIZE - LEAF_NODE_HEADER_SIZE;
+const LEAF_NODE_MAX_CELLS: usize = LEAF_NODE_SPACE_FOR_CELLS / LEAF_NODE_CELL_SIZE;
+
 #[derive(Debug)]
 enum StatementType {
     Insert,
@@ -49,10 +74,15 @@ enum PagerError {
     EmptyPageFlush,
 }
 
+enum NodeType {
+    Internal,
+    Leaf,
+}
+
 #[derive(Debug)]
 #[repr(C)]
 struct Row {
-    id: i32,
+    id: u32,
     username: [u8; COLUMN_USERNAME_SIZE],
     email: [u8; COLUMN_EMAIL_SIZE],
 }
@@ -66,7 +96,7 @@ impl Row {
     fn deserialize(bytes: &[u8]) -> Self {
         let mut username = [0u8; COLUMN_USERNAME_SIZE];
         let mut email = [0u8; COLUMN_EMAIL_SIZE];
-        let id = i32::from_le_bytes(
+        let id = u32::from_le_bytes(
             bytes[ID_OFFSET..ID_OFFSET+ID_SIZE].try_into().unwrap()
         );
         username.copy_from_slice(&bytes[USERNAME_OFFSET..USERNAME_OFFSET+USERNAME_SIZE]);
@@ -123,7 +153,7 @@ impl Statement {
                 return Ok(Self {
                     statement_type: StatementType::Insert,
                     row_to_insert: Some(Row {
-                        id,
+                        id: id as u32,
                         username: username_bytes,
                         email: email_bytes,
                     })
@@ -154,6 +184,7 @@ impl Statement {
 struct Pager {
     file: File,
     file_length: u64,
+    num_pages: u32,
     pages: [Option<Box<[u8; PAGE_SIZE]>>; TABLE_MAX_PAGES]
 }
 
@@ -167,10 +198,15 @@ impl Pager {
             .unwrap();
         let file_length = file.seek(SeekFrom::End(0)).unwrap();
 
+        if file_length as usize % PAGE_SIZE != 0 {
+            panic!("Db file is not a whole number of pages. Corrupt file.");
+        }
+
         const INIT: Option<Box<[u8; PAGE_SIZE]>> = None;
         Self {
             file,
             file_length,
+            num_pages: (file_length / PAGE_SIZE as u64) as u32,
             pages: [INIT; TABLE_MAX_PAGES],
         }
     }
@@ -194,19 +230,23 @@ impl Pager {
             }
 
             self.pages[page_num].replace(page);
+
+            if page_num as u32 >= self.num_pages {
+                self.num_pages = page_num as u32 + 1;
+            }
         }
 
         Ok(&mut self.pages[page_num].as_mut().unwrap()[..])
     }
 
-    fn flush(&mut self, page_num: usize, size: usize) -> Result<(), PagerError> {
+    fn flush(&mut self, page_num: usize) -> Result<(), PagerError> {
         if let None = self.pages[page_num] {
             return Err(PagerError::EmptyPageFlush);
         }
 
         self.file.seek(SeekFrom::Start((page_num * PAGE_SIZE) as u64)).unwrap();
         self.file.write(
-            self.pages[page_num].as_ref().unwrap()[..size].as_ref()
+            self.pages[page_num].as_ref().unwrap().as_ref()
         ).unwrap();
 
         Ok(())
@@ -216,79 +256,153 @@ impl Pager {
 #[derive(Debug)]
 #[repr(C)]
 struct Table {
-    num_rows: usize,
+    root_page_num: u32,
     pager: Pager,
 }
 
 impl Table {
     fn new(filename: &str) -> Self {
-        let pager = Pager::open(filename);
-        let num_rows = pager.file_length as usize / ROW_SIZE;
+        let mut pager = Pager::open(filename);
 
-        Self { num_rows, pager }
+        if pager.num_pages == 0 {
+            let root_node = pager.get_page(0).unwrap();
+            initialize_leaf_node(root_node);
+        }
+
+        Self { root_page_num: 0, pager }
     }
 
     fn close(&mut self) {
-        let num_full_pages = self.num_rows / ROWS_PER_PAGE;
-
-        for i in 0..num_full_pages {
-            match self.pager.pages[i] {
-                Some(_) => self.pager.flush(i, ROW_SIZE).unwrap(),
+        for i in 0..self.pager.num_pages {
+            match self.pager.pages[i as usize] {
+                Some(_) => self.pager.flush(i as usize).unwrap(),
                 None => continue
             };
-        }
-
-        let num_additional_rows = self.num_rows % ROWS_PER_PAGE;
-        if num_additional_rows > 0 {
-            let page_num = num_full_pages;
-            if let Some(_) = self.pager.pages[page_num] {
-                self.pager.flush(page_num, num_additional_rows * ROW_SIZE).unwrap();
-            }
         }
     }
 }
 
+fn leaf_node_num_cells(node: &[u8]) -> u32 {
+    let start = LEAF_NODE_NUM_CELLS_OFFSET;
+    let end = start + LEAF_NODE_NUM_CELLS_SIZE;
+    u32::from_le_bytes(node[start..end].try_into().unwrap())
+}
+
+fn leaf_node_set_num_cells(node: &mut [u8], num_cells: u32) {
+    let start = LEAF_NODE_NUM_CELLS_OFFSET;
+    let end = start + LEAF_NODE_NUM_CELLS_SIZE;
+    node[start..end].copy_from_slice(&num_cells.to_le_bytes());
+}
+
+fn leaf_node_cell(node: &mut [u8], cell_num: u32) -> &mut [u8] {
+    let start = LEAF_NODE_HEADER_SIZE + cell_num as usize * LEAF_NODE_CELL_SIZE;
+    let end = start + LEAF_NODE_CELL_SIZE;
+    &mut node[start..end]
+}
+
+fn copy_within_a_slice<T: Clone>(v: &mut [T], from: usize, to: usize, len: usize) {
+    if from > to {
+        let (dst, src) = v.split_at_mut(from);
+        dst[to..to + len].clone_from_slice(&src[..len]);
+    } else {
+        let (src, dst) = v.split_at_mut(to);
+        dst[..len].clone_from_slice(&src[from..from + len]);
+    }
+}
+
+fn shift_cell_right(node: &mut [u8], cell_num: u32) {
+    let start1 = LEAF_NODE_HEADER_SIZE + cell_num as usize * LEAF_NODE_CELL_SIZE;
+    let start2 = LEAF_NODE_HEADER_SIZE + (cell_num-1) as usize * LEAF_NODE_CELL_SIZE;
+
+    copy_within_a_slice(node, start2, start1, LEAF_NODE_CELL_SIZE);
+}
+
+fn leaf_node_key(node: &mut [u8], cell_num: u32) -> u32 {
+    let cell = leaf_node_cell(node, cell_num);
+    u32::from_le_bytes(cell[..LEAF_NODE_KEY_SIZE].try_into().unwrap())
+}
+
+fn leaf_node_set_key(node: &mut [u8], cell_num: u32, key: u32) {
+    let cell = leaf_node_cell(node, cell_num);
+    cell[..LEAF_NODE_KEY_SIZE].copy_from_slice(&key.to_le_bytes());
+}
+
+fn leaf_node_value(node: &mut [u8], cell_num: u32) -> &mut [u8] {
+    let cell = leaf_node_cell(node, cell_num);
+    &mut cell[LEAF_NODE_KEY_SIZE..]
+}
+
+fn initialize_leaf_node(_node: &mut [u8]) {}
+
+fn leaf_node_insert(cursor: &mut Cursor, key: u32, value: &Row) {
+    let node = cursor.table.pager.get_page(cursor.page_num).unwrap();
+
+    let num_cells = leaf_node_num_cells(node);
+    if num_cells as usize >= LEAF_NODE_MAX_CELLS {
+        panic!("Need to implement splitting a leaf node.")
+    }
+
+    if cursor.cell_num < num_cells as usize {
+        for i in num_cells..cursor.cell_num as u32 {
+            shift_cell_right(node, i);
+        }
+    }
+
+    leaf_node_set_num_cells(node, num_cells + 1);
+    leaf_node_set_key(node, cursor.cell_num as u32, key);
+    value.serialize(leaf_node_value(node, cursor.cell_num as u32));
+}
+
 struct Cursor<'a> {
     table: &'a mut Table,
-    row_num: usize,
+    page_num: usize,
+    cell_num: usize,
     end_of_table: bool,
 }
 
 impl <'a> Cursor<'a> {
     fn table_start(table: &'a mut Table) -> Self {
-        let end_of_table = table.num_rows == 0;
+        let page_num = table.root_page_num;
+        let root_node = table.pager.get_page(page_num as usize).unwrap();
+        let num_cells = leaf_node_num_cells(root_node);
+        let end_of_table = num_cells == 0;
+
         Cursor {
             table,
-            row_num: 0,
+            page_num: page_num as usize,
+            cell_num: 0,
             end_of_table,
         }
     }
 
     fn table_end(table: &'a mut Table) -> Self {
-        let row_num = table.num_rows;
+        let page_num = table.root_page_num;
+        let root_node = table.pager.get_page(table.root_page_num as usize).unwrap();
+        let cell_num = leaf_node_num_cells(root_node);
+
         Cursor {
             table,
-            row_num,
+            page_num: page_num as usize,
+            cell_num: cell_num as usize,
             end_of_table: true,
         }
     }
 
     fn advance(&mut self) {
-        self.row_num += 1;
-        if self.row_num >= self.table.num_rows {
+        let page_num = self.page_num;
+        let node = self.table.pager.get_page(page_num).unwrap();
+
+        self.cell_num += 1;
+        if self.cell_num >= leaf_node_num_cells(node) as usize {
             self.end_of_table = true;
         }
     }
 
     fn value(&mut self) -> &mut [u8] {
-        let row_num = self.row_num;
-        let page_num: usize = row_num / ROWS_PER_PAGE;
-
-        let row_offset = row_num % ROWS_PER_PAGE;
-        let byte_offset = row_offset * ROW_SIZE;
-
+        let page_num = self.page_num;
         let page = self.table.pager.get_page(page_num).unwrap();
-        &mut page[byte_offset..byte_offset+ROW_SIZE]
+
+        leaf_node_value(page, self.cell_num as u32)
     }
 }
 
@@ -298,15 +412,15 @@ enum ExecuteError {
 }
 
 fn execute_insert(statement: &Statement, table: &mut Table) -> Result<(), ExecuteError> {
-    if table.num_rows >= TABLE_MAX_ROWS {
+    let node = table.pager.get_page(table.root_page_num as usize).unwrap();
+
+    if leaf_node_num_cells(node) >= LEAF_NODE_MAX_CELLS as u32 {
         return Err(ExecuteError::TableFull);
     }
 
     let row_to_insert = statement.row_to_insert.as_ref().unwrap();
     let mut cursor = Cursor::table_end(table);
-    row_to_insert.serialize(cursor.value());
-
-    table.num_rows += 1;
+    leaf_node_insert(&mut cursor, row_to_insert.id, &row_to_insert);
 
     Ok(())
 }
