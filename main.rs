@@ -211,32 +211,33 @@ impl Pager {
         }
     }
 
-    fn get_page(&mut self, page_num: usize) -> Result<&mut [u8], PagerError> {
-        if page_num > TABLE_MAX_PAGES {
+    fn get_page(&mut self, page_num: u32) -> Result<&mut [u8], PagerError> {
+        if page_num as usize > TABLE_MAX_PAGES {
             return Err(PagerError::PageNumberOutOfBounds);
         }
 
-        if let None = self.pages[page_num] {
+        if let None = self.pages[page_num as usize] {
             let mut page = Box::new([0u8; PAGE_SIZE]);
-            let mut num_pages = self.file_length as usize / PAGE_SIZE;
+            let mut num_pages = self.file_length / PAGE_SIZE as u64;
 
             if self.file_length % PAGE_SIZE as u64 != 0 {
                 num_pages += 1;
             }
 
-            if page_num <= num_pages {
-                self.file.seek(SeekFrom::Start((page_num * PAGE_SIZE) as u64)).unwrap();
+            if page_num <= num_pages as u32 {
+                self.file.seek(SeekFrom::Start((page_num * PAGE_SIZE as u32) as u64))
+                    .unwrap();
                 self.file.read(&mut *page).unwrap();
             }
 
-            self.pages[page_num].replace(page);
+            self.pages[page_num as usize].replace(page);
 
             if page_num as u32 >= self.num_pages {
                 self.num_pages = page_num as u32 + 1;
             }
         }
 
-        Ok(&mut self.pages[page_num].as_mut().unwrap()[..])
+        Ok(&mut self.pages[page_num as usize].as_mut().unwrap()[..])
     }
 
     fn flush(&mut self, page_num: usize) -> Result<(), PagerError> {
@@ -279,6 +280,59 @@ impl Table {
                 None => continue
             };
         }
+    }
+}
+
+struct Cursor<'a> {
+    table: &'a mut Table,
+    page_num: u32,
+    cell_num: u32,
+    end_of_table: bool,
+}
+
+impl <'a> Cursor<'a> {
+    fn table_start(table: &'a mut Table) -> Self {
+        let page_num = table.root_page_num;
+        let root_node = table.pager.get_page(page_num).unwrap();
+        let num_cells = leaf_node_num_cells(root_node);
+        let end_of_table = num_cells == 0;
+
+        Cursor {
+            table,
+            page_num: page_num,
+            cell_num: 0,
+            end_of_table,
+        }
+    }
+
+    fn table_end(table: &'a mut Table) -> Self {
+        let page_num = table.root_page_num;
+        let root_node = table.pager.get_page(table.root_page_num).unwrap();
+        let cell_num = leaf_node_num_cells(root_node);
+
+        Cursor {
+            table,
+            page_num: page_num,
+            cell_num: cell_num,
+            end_of_table: true,
+        }
+    }
+
+    fn advance(&mut self) {
+        let page_num = self.page_num;
+        let node = self.table.pager.get_page(page_num).unwrap();
+
+        self.cell_num += 1;
+        if self.cell_num >= leaf_node_num_cells(node) {
+            self.end_of_table = true;
+        }
+    }
+
+    fn value(&mut self) -> &mut [u8] {
+        let page_num = self.page_num;
+        let page = self.table.pager.get_page(page_num).unwrap();
+
+        leaf_node_value(page, self.cell_num as u32)
     }
 }
 
@@ -342,7 +396,7 @@ fn leaf_node_insert(cursor: &mut Cursor, key: u32, value: &Row) {
         panic!("Need to implement splitting a leaf node.")
     }
 
-    if cursor.cell_num < num_cells as usize {
+    if cursor.cell_num < num_cells {
         for i in num_cells..cursor.cell_num as u32 {
             shift_cell_right(node, i);
         }
@@ -353,56 +407,12 @@ fn leaf_node_insert(cursor: &mut Cursor, key: u32, value: &Row) {
     value.serialize(leaf_node_value(node, cursor.cell_num as u32));
 }
 
-struct Cursor<'a> {
-    table: &'a mut Table,
-    page_num: usize,
-    cell_num: usize,
-    end_of_table: bool,
-}
-
-impl <'a> Cursor<'a> {
-    fn table_start(table: &'a mut Table) -> Self {
-        let page_num = table.root_page_num;
-        let root_node = table.pager.get_page(page_num as usize).unwrap();
-        let num_cells = leaf_node_num_cells(root_node);
-        let end_of_table = num_cells == 0;
-
-        Cursor {
-            table,
-            page_num: page_num as usize,
-            cell_num: 0,
-            end_of_table,
-        }
-    }
-
-    fn table_end(table: &'a mut Table) -> Self {
-        let page_num = table.root_page_num;
-        let root_node = table.pager.get_page(table.root_page_num as usize).unwrap();
-        let cell_num = leaf_node_num_cells(root_node);
-
-        Cursor {
-            table,
-            page_num: page_num as usize,
-            cell_num: cell_num as usize,
-            end_of_table: true,
-        }
-    }
-
-    fn advance(&mut self) {
-        let page_num = self.page_num;
-        let node = self.table.pager.get_page(page_num).unwrap();
-
-        self.cell_num += 1;
-        if self.cell_num >= leaf_node_num_cells(node) as usize {
-            self.end_of_table = true;
-        }
-    }
-
-    fn value(&mut self) -> &mut [u8] {
-        let page_num = self.page_num;
-        let page = self.table.pager.get_page(page_num).unwrap();
-
-        leaf_node_value(page, self.cell_num as u32)
+fn print_leaf_node(node: &mut [u8]) {
+    let num_cells = leaf_node_num_cells(node);
+    println!("leaf (size {})", num_cells);
+    for i in 0..num_cells {
+        let key = leaf_node_key(node, i);
+        println!("  - {} : {}", i, key);
     }
 }
 
@@ -412,7 +422,7 @@ enum ExecuteError {
 }
 
 fn execute_insert(statement: &Statement, table: &mut Table) -> Result<(), ExecuteError> {
-    let node = table.pager.get_page(table.root_page_num as usize).unwrap();
+    let node = table.pager.get_page(table.root_page_num).unwrap();
 
     if leaf_node_num_cells(node) >= LEAF_NODE_MAX_CELLS as u32 {
         return Err(ExecuteError::TableFull);
@@ -447,6 +457,15 @@ fn execute_statement(
     }
 }
 
+fn print_constants() {
+    println!("ROW_SIZE: {}", ROW_SIZE);
+    println!("COMMON_HEADER_SIZE: {}", COMMON_NODE_HEADER_SIZE);
+    println!("LEAF_NODE_HEADER_SIZE: {}", LEAF_NODE_HEADER_SIZE);
+    println!("LEAF_NODE_CELL_SIZE: {}", LEAF_NODE_CELL_SIZE);
+    println!("LEAF_NODE_SPACE_FOR_CELLS: {}", LEAF_NODE_SPACE_FOR_CELLS);
+    println!("LEAF_NODE_MAX_CELLS: {}", LEAF_NODE_MAX_CELLS);
+}
+
 fn read_input(prompt: &str) -> io::Result<String> {
     print!("{}", prompt);
     io::stdout().flush()?;
@@ -463,8 +482,17 @@ fn do_meta_command(command: &str, table: &mut Table) -> Result<(), ()> {
             table.close();
             process::exit(0);
         },
+        ".constants" => {
+            println!("Constants:");
+            print_constants();
+        },
+        ".btree" => {
+            println!("Tree:");
+            print_leaf_node(table.pager.get_page(0).unwrap());
+        }
         _ => return Err(())
     };
+    Ok(())
 }
 
 fn main() -> io::Result<()> {
