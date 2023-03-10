@@ -125,3 +125,46 @@ def test_keeps_data_after_closing_connection():
         "db > ",
     ]
 
+
+def test_print_constants():
+    script = [
+        ".constants",
+        ".exit",
+    ]
+
+    result = run_script(script)
+
+    assert result == [
+        "db > Constants:",
+        "ROW_SIZE: 291",
+        "COMMON_HEADER_SIZE: 6",
+        "LEAF_NODE_HEADER_SIZE: 10",
+        "LEAF_NODE_CELL_SIZE: 295",
+        "LEAF_NODE_SPACE_FOR_CELLS: 4086",
+        "LEAF_NODE_MAX_CELLS: 13",
+        "db > ",
+    ]
+
+
+def test_print_one_node_tree():
+    script = []
+    for i in (3, 1, 2):
+        script.append(f"insert {i} user{i} person{i}@example.com")
+    script += [
+        ".btree",
+        ".exit",
+    ]
+
+    result = run_script(script)
+
+    assert result == [
+        "db > Executed.",
+        "db > Executed.",
+        "db > Executed.",
+        "db > Tree:",
+        "leaf (size 3)",
+        "  - 0 : 3",
+        "  - 1 : 1",
+        "  - 2 : 2",
+        "db > ",
+    ]
